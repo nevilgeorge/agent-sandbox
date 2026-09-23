@@ -79,11 +79,16 @@ volume to migrate, and no machine-specific state. The same image plus the same
 `hello-world/` is a small Python project included in this repo purely as a
 target to try the examples below against.
 
-## Usage
+## Go supervisor
 
-For applications that need to manage multiple containers directly, the Go
-[`supervisor` package](supervisor/README.md) provides start, exec, stop, cleanup,
-and restart recovery through the Docker API.
+The [`supervisor` package](supervisor/README.md) lets a Go application manage
+containers through the Docker API. It uses the image built by `./sandbox build`;
+the `sandbox` script remains available for direct CLI use. The package requires
+Go 1.24 or newer and a reachable local Docker daemon.
+
+This section is still WIP. Inspired by the architecture of (Pinecone)[https://sierra.ai/blog/pinecone-harnessing-the-wisdom-of-the-workforce].
+
+## Usage
 
 ```sh
 ./sandbox run                        # mount the current directory at /workspace
