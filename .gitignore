@@ -1,0 +1,24 @@
+# Credentials. The container persists nothing, so this file is the only place
+# long-lived keys live -- keep it out of history.
+.env
+.env.*
+!.env.example
+
+# Python. Agents run python3 inside the mounted workspace, so bytecode and
+# virtualenvs appear wherever they work, not just in hello-world/.
+__pycache__/
+*.py[oc]
+.venv/
+
+# Claude Code writes machine-local settings here; the shared settings.json,
+# if one is ever added, stays tracked.
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
