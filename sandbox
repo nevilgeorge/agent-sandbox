@@ -97,6 +97,16 @@ cmd_rebuild() {
 }
 
 cmd_run() {
+    cmd_launch run "$@"
+}
+
+cmd_start() {
+    cmd_launch start "$@"
+}
+
+cmd_launch() {
+    local mode="$1"
+    shift
     load_env_file
     require_daemon
     "$DOCKER" image inspect "$IMAGE" >/dev/null 2>&1 \
@@ -105,7 +115,9 @@ cmd_run() {
     local workdir="" mounts=() command=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            --) shift; command=("$@"); break ;;
+            --)
+                [ "$mode" = run ] || die "start does not accept a command; use sandbox exec after starting"
+                shift; command=("$@"); break ;;
             -v|--volume)
                 [ $# -ge 2 ] || die "-v needs an argument"
                 local spec="$2" host rest
@@ -114,7 +126,7 @@ cmd_run() {
                 mounts+=(-v "$(abspath "$host"):$rest")
                 shift 2 ;;
             -h|--help) usage; exit 0 ;;
-            -*) die "unknown option for run: $1" ;;
+            -*) die "unknown option for $mode: $1" ;;
             *)
                 [ -z "$workdir" ] || die "only one workspace directory may be given"
                 workdir="$1"; shift ;;
@@ -160,8 +172,12 @@ cmd_run() {
     # still works from scripts and pipelines.
     local tty_args=(-i)
     if [ -t 0 ] && [ -t 1 ]; then tty_args=(-it); fi
+    if [ "$mode" = start ]; then
+        tty_args=(-d --init --name agent-sandbox)
+        command=(bash -c 'touch /tmp/.sandbox-ready && exec sleep infinity')
+    fi
 
-    exec "$DOCKER" run --rm "${tty_args[@]}" \
+    local docker_args=(run --rm "${tty_args[@]}" \
         --label "$LABEL" \
         --hostname agent-sandbox \
         --security-opt no-new-privileges \
@@ -171,14 +187,58 @@ cmd_run() {
         -v "$workdir:/workspace" \
         "${mounts[@]+"${mounts[@]}"}" \
         "${env_args[@]+"${env_args[@]}"}" \
-        "$IMAGE" "${command[@]+"${command[@]}"}"
+        "$IMAGE" "${command[@]+"${command[@]}"}")
+    if [ "$mode" = start ]; then
+        local cid attempt
+        cid="$("$DOCKER" "${docker_args[@]}")"
+        # The entrypoint initializes authentication before invoking our command.
+        # Wait for that setup so an immediate `sandbox exec` is ready to use.
+        for ((attempt=0; attempt<60; attempt++)); do
+            if "$DOCKER" exec "$cid" test -f /tmp/.sandbox-ready 2>/dev/null; then
+                printf '%s\n' "$cid"
+                return 0
+            fi
+            [ "$("$DOCKER" inspect --format '{{.State.Running}}' "$cid" 2>/dev/null)" = true ] \
+                || die "sandbox exited during startup"
+            sleep 0.5
+        done
+        die "sandbox startup timed out; check docker logs $cid, or use ./sandbox stop"
+    fi
+    exec "$DOCKER" "${docker_args[@]}"
+}
+
+running_container() {
+    require_daemon
+    local cid
+    cid="$("$DOCKER" ps -q --filter "label=$LABEL")"
+    [ -n "$cid" ] || die "no running sandbox container. Start one with ./sandbox start <dir>."
+    case "$cid" in
+        *$'\n'*) die "multiple sandbox containers are running; use docker exec/stop with an explicit container ID" ;;
+    esac
+    printf '%s\n' "$cid"
+}
+
+cmd_exec() {
+    [ "${1:-}" != -- ] || shift
+    [ $# -gt 0 ] || die "exec requires a command: sandbox exec -- CMD..."
+    local cid
+    cid="$(running_container)"
+    # Never allocate a TTY: preserve plain stdin, stdout, stderr and exit status.
+    exec "$DOCKER" exec -i "$cid" "$@"
+}
+
+cmd_stop() {
+    [ $# -eq 0 ] || die "stop does not accept arguments"
+    local cid
+    cid="$(running_container)"
+    # Containers launched by run/start use --rm, so stopping also removes them.
+    exec "$DOCKER" stop "$cid"
 }
 
 cmd_shell() {
-    require_daemon
+    [ $# -eq 0 ] || die "shell does not accept arguments"
     local cid
-    cid="$("$DOCKER" ps -q --filter "label=$LABEL" --latest)"
-    [ -n "$cid" ] || die "no running sandbox container. Start one with ./sandbox run <dir>."
+    cid="$(running_container)"
     exec "$DOCKER" exec -it "$cid" bash -l
 }
 
@@ -189,12 +249,16 @@ agent-sandbox -- run CLI coding agents in an isolated Linux container.
 Usage:
   sandbox build [docker build flags]   Build the image
   sandbox rebuild                      Rebuild from scratch, prune the old image
+  sandbox start [DIR] [-v SRC:DST[:ro]]...
+                                       Start a background sandbox (prints its ID)
   sandbox run [DIR] [-v SRC:DST[:ro]]... [-- CMD...]
                                        Mount DIR (default: cwd) at /workspace
                                        and open a shell, or run CMD
-  sandbox shell                        Open another shell in the running sandbox
+  sandbox exec [--] CMD...             Run CMD through stdio in the running sandbox
+  sandbox shell                        Open an interactive shell in the running sandbox
+  sandbox stop                         Stop and remove the running sandbox
 
-Auth (required -- the container persists nothing):
+Auth (required at run/start -- state lasts until the container is removed):
   Read from ./.env (gitignored; copy .env.example) or the shell environment,
   with exported variables winning. Every KEY=VALUE in .env reaches the container.
   ANTHROPIC_API_KEY              for claude
@@ -208,6 +272,10 @@ Environment:
 
 Examples:
   ./sandbox build
+  ./sandbox start ~/code/myproject
+  ./sandbox exec -- python3 script.py
+  ./sandbox shell
+  ./sandbox stop
   ./sandbox run ~/code/myproject
   ./sandbox run ~/code/myproject -v ~/datasets:/mnt/data:ro
   ./sandbox run . -- claude --dangerously-skip-permissions
@@ -218,6 +286,9 @@ case "${1:-}" in
     build)       shift; cmd_build "$@" ;;
     rebuild)     shift; cmd_rebuild "$@" ;;
     run)         shift; cmd_run "$@" ;;
+    start)       shift; cmd_start "$@" ;;
+    exec)        shift; cmd_exec "$@" ;;
+    stop)        shift; cmd_stop "$@" ;;
     shell)       shift; cmd_shell "$@" ;;
     ""|-h|--help|help) usage ;;
     *) die "unknown command: $1 (try ./sandbox --help)" ;;
