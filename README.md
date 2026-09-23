@@ -81,6 +81,10 @@ target to try the examples below against.
 
 ## Usage
 
+For applications that need to manage multiple containers directly, the Go
+[`supervisor` package](supervisor/README.md) provides start, exec, stop, cleanup,
+and restart recovery through the Docker API.
+
 ```sh
 ./sandbox run                        # mount the current directory at /workspace
 ./sandbox run ~/code/myproject       # mount that directory instead
