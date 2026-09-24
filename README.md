@@ -11,6 +11,7 @@ rein over your home directory.
 Debian bookworm (`node:22-bookworm-slim`) with:
 
 - **Python 3.11** (`python3`, `pip`, `venv`)
+- **uv** (`uv`, `uvx`) -- also fetches other Python versions on demand
 - **git**
 - **Node 22** + npm
 - **Claude Code** (`@anthropic-ai/claude-code`) and **Codex** (`@openai/codex`)
@@ -25,15 +26,18 @@ Everything runs as the non-root user `agent` (uid 1000).
 with Node unpacked into `/usr/local` by the Node maintainers. It was chosen because
 both agent CLIs ship through npm, so Node has to be there regardless.
 
-The base contributes little to image size: of ~1.8GB, the agent CLIs account for
-~560MB and `build-essential` for most of the ~420MB apt layer. Alpine would save
+The base contributes little to image size: of ~1.9GB, the agent CLIs account for
+~555MB (Claude Code 228MB, Codex 327MB -- measured, and npm installs only the
+matching `linux-arm64` binaries, not every platform), `build-essential` for most
+of the ~467MB apt layer, and `uv` for 48MB. Alpine would save
 ~150MB and cost you Python's prebuilt `manylinux` wheels (musl forces `pip` to
 compile from source). Ubuntu 24.04 would get you Python 3.12 and git 2.43 instead
 of 3.11 and 2.39, at the price of installing Node by hand — a reasonable swap if
 you ever want it, but not one the base was doing much work for either way.
 
-If a project needs a newer Python than 3.11, build a venv inside the container
-rather than rebuilding the image.
+If a project needs a different Python than 3.11, use uv rather than rebuilding the
+image: `uv python install 3.9` fetches an interpreter into the agent's home with no
+root, and `uv run` builds a venv around it. `hello-world/` exercises exactly this.
 
 ## Setup
 
@@ -143,7 +147,7 @@ Other commands:
 | Command | Purpose |
 |---|---|
 | `./sandbox shell` | Open a second shell in the running sandbox |
-| `./sandbox rebuild` | Rebuild from scratch (picks up new agent versions) |
+| `./sandbox rebuild` | Rebuild from scratch, ignoring all caches |
 | `./sandbox --help` | Full usage |
 
 Resource caps, if you want them:
@@ -156,15 +160,27 @@ SANDBOX_CPUS=4 SANDBOX_MEMORY=8g ./sandbox run ~/code/myproject
 
 ## Notes
 
-- **Agent versions are baked in at build time.** `./sandbox rebuild` pulls the latest.
-  To pin either CLI: `./sandbox build --build-arg CLAUDE_VERSION=2.1.280
-  --build-arg CODEX_VERSION=0.156.1` (the versions currently in the image).
+- **Agent versions are pinned in the Dockerfile**, so a build is reproducible and
+  `./sandbox rebuild` no longer moves them on its own. To bump, edit the
+  `CLAUDE_VERSION` / `CODEX_VERSION` defaults, or override per build:
+  `./sandbox build --build-arg CLAUDE_VERSION=latest`. Both CLIs are verified at
+  build time (`claude --version && codex --version`), so a broken install fails the
+  build rather than the first agent run.
+- **Builds use BuildKit cache mounts** for apt and npm, so an ordinary
+  `./sandbox build` after a version bump unpacks from local disk instead of
+  re-downloading. Note `./sandbox rebuild` passes `--no-cache`, which on Docker 29.x
+  empties those mounts too -- prefer a plain `./sandbox build` unless you actually
+  want a cold build. The entrypoint is copied in the last layer, so editing
+  `docker/entrypoint.sh` rebuilds in about a second.
 - **Networking is unrestricted.** The isolation here is filesystem and process, not
   network — the agent can reach anything your machine can.
 - **git identity** is copied from your host `git config --global` at run time. Commits
   made in the container are unsigned; your macOS signing keys are not mounted.
-- **pip** on bookworm is PEP 668-managed. Use a venv (`python3 -m venv .venv`) or
-  `pip install --break-system-packages` for throwaway installs.
+- **Use uv for Python work.** `uv venv`, `uv run` and `uv sync` all work out of the
+  box and sidestep bookworm's PEP 668 restriction on the system `pip`. If you do
+  reach for `pip` directly, it needs a venv (`python3 -m venv .venv`) or
+  `pip install --break-system-packages`. Because the container is stateless, a
+  uv-managed interpreter is re-fetched on each run (~28MB for CPython 3.9).
 - **The container is stateless.** Each `./sandbox run` is a fresh `--rm` container
   with no volumes attached. Anything written outside `/workspace` and your extra
   `-v` mounts is discarded on exit -- including agent config, caches and session
