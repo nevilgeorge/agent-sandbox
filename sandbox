@@ -177,10 +177,28 @@ cmd_launch() {
         command=(bash -c 'touch /tmp/.sandbox-ready && exec sleep infinity')
     fi
 
+    # Two independent restrictions on privilege, not one.
+    #
+    # no-new-privileges sets the kernel's NO_NEW_PRIVS flag, so no execve
+    # inside the container can ever gain privilege it did not start with.
+    # That neutralizes setuid binaries and file capabilities -- it is why
+    # `sudo` would fail here even if the image had it.
+    #
+    # cap-drop ALL empties the capability set the container starts with.
+    # Docker's default grants 14, including NET_RAW, CHOWN, SETUID and
+    # MKNOD; an agent running with --dangerously-skip-permissions needs
+    # none of them, and each is a rung an exploit could climb. Together
+    # the two flags mean the process holds nothing and can acquire
+    # nothing: `grep CapEff /proc/self/status` reads all zeroes.
+    #
+    # This is also why the image runs `setcap -r /usr/bin/ping` -- see the
+    # Dockerfile. Anything else expecting a file capability will fail the
+    # same way, with an error that does not mention capabilities.
     local docker_args=(run --rm "${tty_args[@]}" \
         --label "$LABEL" \
         --hostname agent-sandbox \
         --security-opt no-new-privileges \
+        --cap-drop ALL \
         --pids-limit "${SANDBOX_PIDS:-2048}" \
         ${SANDBOX_CPUS:+--cpus "$SANDBOX_CPUS"} \
         ${SANDBOX_MEMORY:+--memory "$SANDBOX_MEMORY"} \

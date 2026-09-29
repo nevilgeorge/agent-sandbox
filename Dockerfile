@@ -9,7 +9,17 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 # against bind-mounted host folders.
 FROM node:22-bookworm-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
+# ARG, not ENV: this only needs to suppress debconf during the builds below.
+# As an ENV it is recorded in the image config and leaks into every agent's
+# runtime environment, where it means nothing.
+ARG DEBIAN_FRONTEND=noninteractive
+
+# The base image sets neither. Python coerces the C locale to UTF-8 on its own
+# (PEP 538), but rg, jq and git get no such guarantee -- and the corpora these
+# agents read are full of non-ASCII names and MIME-encoded headers. SHELL is
+# for the tools that shell out by reading it rather than assuming /bin/sh.
+ENV LANG=C.UTF-8 \
+    SHELL=/bin/bash
 
 # Debian's docker-clean hook deletes downloaded .debs after each install, which
 # would defeat the cache mount below, so drop it and tell apt to keep them.
@@ -25,27 +35,93 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 # There is deliberately no `rm -rf /var/lib/apt/lists/*`: with /var/lib/apt
 # mounted that would wipe the cache we just populated, and the lists never
 # reach a layer either way.
+#
+# Dropping EXTERNALLY-MANAGED at the end opts this image out of PEP 668, so a
+# bare `pip install x` works instead of erroring. It is safe here precisely
+# because of how the container is run: as a non-root user, pip has nowhere to
+# write but ~/.local, and the container is stateless, so whatever an agent
+# installs is discarded on exit. uv remains the better tool for real work.
+#
+# `setcap -r /usr/bin/ping` strips the binary's cap_net_raw file capability.
+# Containers run with --cap-drop ALL and no-new-privileges, so that capability
+# can never be granted, and iputils refuses to start rather than fall back --
+# ping fails with a bare "Operation not permitted". Without the file capability
+# it opens an unprivileged SOCK_DGRAM ICMP socket instead, which works because
+# Docker sets net.ipv4.ping_group_range wide enough to cover uid 1000.
+# libcap2-bin is what provides setcap. It also leaves getcap in the image for
+# diagnosing this class of failure, though at /usr/sbin/getcap: Debian keeps
+# sbin off a non-root login shell's PATH, so it needs the full path.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update -o Acquire::Retries=3 \
     && apt-get install -y --no-install-recommends \
+    # --- Python -------------------------------------------------------
+    # bookworm's 3.11. Use uv when a project needs a different version.
         python3 \
+    # pip and venv are separate packages on Debian; python3 alone has neither.
         python3-pip \
         python3-venv \
+    # Ships /usr/bin/python. Debian deliberately omits it, but agents type
+    # `python` reflexively and otherwise hit "command not found".
+        python-is-python3 \
+    # --- Source control ------------------------------------------------
         git \
+    # git over ssh, and the ssh-keyscan/ssh-agent bits tools shell out to.
+        openssh-client \
+    # --- Network -------------------------------------------------------
+    # TLS roots. Every https fetch below and at run time depends on these.
         ca-certificates \
         curl \
         wget \
-        less \
-        jq \
-        ripgrep \
-        build-essential \
-        openssh-client \
-        procps \
+    # dig and nslookup -- separate DNS resolution from connection failures.
         dnsutils \
-        vim-tiny
+    # ip and ss. The sandbox's network is the thing most likely to be
+    # deliberately restricted, so give the agent a way to see what it has.
+        iproute2 \
+    # See the setcap note above: usable only because the file capability is
+    # stripped, since the container drops all capabilities.
+        iputils-ping \
+    # Provides setcap for the line at the end of this RUN, and leaves getcap
+    # behind for inspecting file capabilities.
+        libcap2-bin \
+    # --- Search and data shaping ---------------------------------------
+    # The three tools agent_kit's CLAUDE.md files actually instruct agents
+    # to use over the mail and calendar corpora: rg, jq and python3.
+        ripgrep \
+        jq \
+    # Not used by the indexes today, but the obvious next step for them.
+        sqlite3 \
+    # --- Files ---------------------------------------------------------
+    # Identify a blob by content rather than trusting its extension --
+    # mail attachments routinely lie about what they are.
+        file \
+        tree \
+        rsync \
+    # The base ships tar and gzip and nothing else. Attachments arrive as
+    # all of these.
+        unzip \
+        zip \
+        xz-utils \
+    # --- Processes -----------------------------------------------------
+    # ps and top: let an agent check whether something it backgrounded
+    # is still alive.
+        procps \
+    # Which process holds a port or a file. Pairs with ss above.
+        lsof \
+    # --- Building and editing ------------------------------------------
+    # Compilers for Python wheels with no prebuilt manylinux binary.
+    # The single largest contributor to this layer, at roughly 400MB.
+        build-essential \
+    # A pager exists (less) and an editor exists (vim-tiny), because tools
+    # shell out to $PAGER and $EDITOR and fail oddly when they are absent.
+        less \
+        vim-tiny \
+    && rm -f /usr/lib/python3*/EXTERNALLY-MANAGED \
+    && setcap -r /usr/bin/ping
 
+# Two static binaries lifted out of the stage declared at the top of the file.
 COPY --from=uv /uv /uvx /usr/local/bin/
+# Build-time smoke test: fail here rather than at an agent's first `uv run`.
 RUN uv --version
 # uv's cache lives in $HOME but venvs are created under the /workspace bind
 # mount, a different filesystem -- without this uv warns about failed hardlinks
@@ -74,6 +150,8 @@ RUN printf 'export PATH=/home/agent/.npm-global/bin:$PATH\n' \
 
 # npm installs run as `agent` so Claude Code can self-update in place.
 USER agent
+# The ENV form of the PATH fix above. /etc/profile.d covers login shells;
+# this covers everything else -- `docker exec`, ENTRYPOINT, non-login `sh -c`.
 ENV PATH=/home/agent/.npm-global/bin:$PATH
 # Keep all of Claude Code's state under one directory rather than scattering
 # .claude.json into $HOME. Nothing here persists -- auth comes from the
@@ -120,6 +198,12 @@ RUN --mount=type=cache,target=/home/agent/.npm,uid=1000,gid=1000,sharing=locked 
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN bash -n /usr/local/bin/entrypoint.sh
 
+# Where the host directory gets bind-mounted, so an agent starts already
+# inside the only tree it is meant to touch.
 WORKDIR /workspace
+# The entrypoint seeds git identity and Codex auth, then `exec "$@"` hands off,
+# so it runs ahead of CMD and of anything passed to `./sandbox run DIR -- CMD`.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# A login shell, which is what makes /etc/profile.d/10-npm-global.sh load.
+# Overridden whenever a command is passed to `./sandbox run`.
 CMD ["bash", "-l"]

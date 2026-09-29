@@ -10,13 +10,14 @@ rein over your home directory.
 
 Debian bookworm (`node:22-bookworm-slim`) with:
 
-- **Python 3.11** (`python3`, `pip`, `venv`)
+- **Python 3.11** (`python3`, `python`, `pip`, `venv`)
 - **uv** (`uv`, `uvx`) -- also fetches other Python versions on demand
 - **git**
 - **Node 22** + npm
 - **Claude Code** (`@anthropic-ai/claude-code`) and **Codex** (`@openai/codex`)
-- curl, wget, jq, ripgrep, less, vim-tiny, build-essential, openssh-client,
-  procps, dnsutils
+- curl, wget, jq, ripgrep, less, vim-tiny, build-essential, openssh-client
+- file, tree, rsync, sqlite3, unzip, zip, xz-utils
+- procps, lsof, dnsutils, iproute2, iputils-ping
 
 Everything runs as the non-root user `agent` (uid 1000).
 
@@ -174,13 +175,20 @@ SANDBOX_CPUS=4 SANDBOX_MEMORY=8g ./sandbox run ~/code/myproject
   `docker/entrypoint.sh` rebuilds in about a second.
 - **Networking is unrestricted.** The isolation here is filesystem and process, not
   network — the agent can reach anything your machine can.
+- **Containers run unprivileged.** Every run sets `--cap-drop ALL` and
+  `--security-opt no-new-privileges`, so the agent holds no Linux capabilities and
+  cannot regain any. There is deliberately no `sudo` in the image: this boundary is
+  a shared kernel, not a VM, so root inside the container is worth far more to an
+  attacker than `apt-get install` is to an agent. Install into the workspace with
+  `uv` or `npm --prefix` instead, or bake the dependency into the image.
 - **git identity** is copied from your host `git config --global` at run time. Commits
   made in the container are unsigned; your macOS signing keys are not mounted.
 - **Use uv for Python work.** `uv venv`, `uv run` and `uv sync` all work out of the
-  box and sidestep bookworm's PEP 668 restriction on the system `pip`. If you do
-  reach for `pip` directly, it needs a venv (`python3 -m venv .venv`) or
-  `pip install --break-system-packages`. Because the container is stateless, a
-  uv-managed interpreter is re-fetched on each run (~28MB for CPython 3.9).
+  box. Because the container is stateless, a uv-managed interpreter is re-fetched
+  on each run (~28MB for CPython 3.9). A bare `pip install` also works — the image
+  drops Debian's `EXTERNALLY-MANAGED` marker, so PEP 668 does not get in the way —
+  and it lands in `~/.local`, since pip runs as a non-root user. That install is
+  discarded when the container exits, like everything else outside `/workspace`.
 - **The container is stateless.** Each `./sandbox run` is a fresh `--rm` container
   with no volumes attached. Anything written outside `/workspace` and your extra
   `-v` mounts is discarded on exit -- including agent config, caches and session
